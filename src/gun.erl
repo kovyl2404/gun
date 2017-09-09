@@ -116,9 +116,11 @@
 	opts :: opts(),
 	keepalive_ref :: undefined | reference(),
 	socket :: undefined | inet:socket() | ssl:sslsocket(),
-	transport :: module(),
+	transport 			 :: ssl | tcp,
+	transport_module :: module(),
 	protocol :: module(),
 	protocol_state :: any(),
+	connector  		 :: undefined | fun((_, _, _, _, _) -> {ok, inet:socket() | ssl:sslsocket()}),
 	last_error :: any()
 }).
 
@@ -196,6 +198,8 @@ check_options([{ws_opts, ProtoOpts}|Opts]) when is_map(ProtoOpts) ->
 		Error ->
 			Error
 	end;
+check_options([{connector, C} | Opts]) when is_function(C, 5) ->
+	check_options(Opts);
 check_options([Opt|_]) ->
 	{error, {options, Opt}}.
 
@@ -212,7 +216,7 @@ consider_tracing(_, _) ->
 
 -spec info(pid()) -> map().
 info(ServerPid) ->
-	{_, #state{socket=Socket, transport=Transport}} = sys:get_state(ServerPid),
+	{_, #state{socket=Socket, transport_module =Transport}} = sys:get_state(ServerPid),
 	{ok, {SockIP, SockPort}} = Transport:sockname(Socket),
 	#{sock_ip => SockIP, sock_port => SockPort}.
 
@@ -536,18 +540,36 @@ proc_lib_hack(Parent, Owner, Host, Port, Opts) ->
 init(Parent, Owner, Host, Port, Opts) ->
 	ok = proc_lib:init_ack(Parent, {ok, self()}),
 	Retry = maps:get(retry, Opts, 5),
-	Transport = case maps:get(transport, Opts, default_transport(Port)) of
+
+	Transport = maps:get(transport, Opts, default_transport(Port)),
+	TransportModule = case Transport of
 		tcp -> ranch_tcp;
 		ssl -> ranch_ssl
 	end,
+	Connector = maps:get(connector, Opts, undefined),
 	OwnerRef = monitor(process, Owner),
+	ActualConnector =
+		case Connector of
+			undefined ->
+				fun(Host, Port, _, TransportOpts, Timeout) ->
+					TransportModule:connect(Host, Port, TransportOpts, Timeout)
+				end;
+			Value ->
+				Value
+		end,
 	connect(#state{parent=Parent, owner=Owner, owner_ref=OwnerRef,
-		host=Host, port=Port, opts=Opts, transport=Transport}, Retry).
+		host=Host, port=Port, opts=Opts, transport_module = TransportModule, transport = Transport, connector = ActualConnector}, Retry).
 
 default_transport(443) -> ssl;
 default_transport(_) -> tcp.
 
-connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport=ranch_ssl}, Retries) ->
+connect(
+	#state{
+		host=Host, port=Port,
+		opts=Opts, transport_module = ranch_ssl,
+		transport = Transport, connector = Connector
+	} = State, Retries
+) ->
 	Protocols = [case P of
 		http -> <<"http/1.1">>;
 		http2 -> <<"h2">>
@@ -556,20 +578,23 @@ connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport=ranch_
 		{alpn_advertised_protocols, Protocols},
 		{client_preferred_next_protocols, {client, Protocols, <<"http/1.1">>}}
 		|maps:get(transport_opts, Opts, [])],
-	case Transport:connect(Host, Port, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
+
+	lager:info("Connecting to ~p:~p using transport ~p",[Host, Port, Transport]),
+	case Connector(Host, Port, Transport, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
 		{ok, Socket} ->
 			{Protocol, ProtoOptsKey} = case ssl:negotiated_protocol(Socket) of
-				{ok, <<"h2">>} -> {gun_http2, http2_opts};
-				_ -> {gun_http, http_opts}
-			end,
+																	 {ok, <<"h2">>} -> {gun_http2, http2_opts};
+																	 _ -> {gun_http, http_opts}
+																 end,
 			up(State, Socket, Protocol, ProtoOptsKey);
 		{error, Reason} ->
 			retry(State#state{last_error=Reason}, Retries)
 	end;
-connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport}, Retries) ->
+
+connect(State=#state{host=Host, port=Port, opts=Opts, transport = Transport, connector = Connector}, Retries) ->
 	TransportOpts = [binary, {active, false}
 		|maps:get(transport_opts, Opts, [])],
-	case Transport:connect(Host, Port, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
+	case Connector(Host, Port, Transport, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
 		{ok, Socket} ->
 			{Protocol, ProtoOptsKey} = case maps:get(protocols, Opts, [http]) of
 				[http] -> {gun_http, http_opts};
@@ -577,10 +602,11 @@ connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport}, Retr
 			end,
 			up(State, Socket, Protocol, ProtoOptsKey);
 		{error, Reason} ->
+			lager:info("Failed to connect due to ~p, ~p retries left",[Reason, Retries]),
 			retry(State#state{last_error=Reason}, Retries)
 	end.
 
-up(State=#state{owner=Owner, opts=Opts, transport=Transport}, Socket, Protocol, ProtoOptsKey) ->
+up(State=#state{owner=Owner, opts=Opts, transport_module =Transport}, Socket, Protocol, ProtoOptsKey) ->
 	ProtoOpts = maps:get(ProtoOptsKey, Opts, #{}),
 	ProtoState = Protocol:init(Owner, Socket, Transport, ProtoOpts),
 	Owner ! {gun_up, self(), Protocol:name()},
@@ -631,7 +657,7 @@ before_loop(State=#state{opts=Opts, protocol=Protocol}) ->
 	loop(State#state{keepalive_ref=KeepaliveRef}).
 
 loop(State=#state{parent=Parent, owner=Owner, owner_ref=OwnerRef, host=Host, port=Port, opts=Opts,
-		socket=Socket, transport=Transport, protocol=Protocol, protocol_state=ProtoState}) ->
+		socket=Socket, transport_module =Transport, protocol=Protocol, protocol_state=ProtoState}) ->
 	{OK, Closed, Error} = Transport:messages(),
 	Transport:setopts(Socket, [{active, once}]),
 	receive
@@ -727,7 +753,7 @@ loop(State=#state{parent=Parent, owner=Owner, owner_ref=OwnerRef, host=Host, por
 	end.
 
 ws_loop(State=#state{parent=Parent, owner=Owner, owner_ref=OwnerRef, socket=Socket,
-		transport=Transport, protocol=Protocol, protocol_state=ProtoState}) ->
+		transport_module =Transport, protocol=Protocol, protocol_state=ProtoState}) ->
 	{OK, Closed, Error} = Transport:messages(),
 	Transport:setopts(Socket, [{active, once}]),
 	receive
